@@ -65,7 +65,8 @@ public static void setupFT() throws IOException, InterruptedException {
 	Best to remove paxos_logs with each test to avoid errors from carrying
 	over. Put here defensively in case students forget to do so manually.
 	 */
-	if(GIGAPAXOS_MODE) Util.recursiveRemove(new File("paxos_logs"));
+	//if(GIGAPAXOS_MODE)
+		Util.recursiveRemove(new File("paxos_logs"));
 	// kill all started processes before shutdown
 	addShutdownHook();
 
