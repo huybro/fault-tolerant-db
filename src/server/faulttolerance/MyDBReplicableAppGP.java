@@ -120,20 +120,26 @@ public class MyDBReplicableAppGP implements Replicable {
 
         String commandString = request.toString();
         
-        // 1. Initial Filtering for Internal Messages or Empty Payloads
-        // If the request string is short (like '0', '1', '{"B"', etc.) it's likely an internal control packet.
-        // We look for a colon (:) which separates CMD:KEY:VALUE.
-        if (commandString == null || commandString.length() < 3 || !commandString.contains(":")) {
-             // Further filter out simple numbers which are common IDs for internal messages
-             if (commandString.trim().matches("\\d+")) {
-                System.out.println("Skipping internal numerical message: " + commandString);
-                return true;
-             }
-             System.err.println("Invalid command format (missing ':' or too short): " + commandString);
-             return false;
+        // --- Robust Payload Filtering and Extraction ---
+        // 1. Check for known internal GigaPaxos messages (like JSON fragments or control packets)
+        if (commandString == null || commandString.length() < 3 || commandString.startsWith("{\"B") || commandString.startsWith("{\"NFWDS")) {
+             System.out.println("Skipping non-application message: " + commandString);
+             return true;
         }
 
-        // 2. Parse the command string: CMD:KEY:VALUE or CMD:KEY
+        // 2. Filter out simple numerical packets (often internal IDs)
+        if (commandString.trim().matches("\\d+") && commandString.trim().length() < 5) {
+             System.out.println("Skipping internal numerical message: " + commandString);
+             return true;
+        }
+
+        // 3. Application command check: Must contain ":" and start with a known command verb.
+        if (!commandString.contains(":")) {
+             System.err.println("Invalid command format (missing ':'): " + commandString);
+             return false;
+        }
+        
+        // 4. Parse the command string: CMD:KEY:VALUE or CMD:KEY
         String[] parts = commandString.split(":", 3);
         String cmd = parts[0].trim();
         String key = parts.length > 1 ? parts[1].trim() : null;
@@ -141,7 +147,7 @@ public class MyDBReplicableAppGP implements Replicable {
 
         // Final key check
         if (key == null || key.isEmpty()) {
-             System.err.println("Invalid command format (missing key): " + commandString);
+             System.err.println("Invalid command format (missing key after command): " + commandString);
              return false;
         }
 
@@ -173,6 +179,7 @@ public class MyDBReplicableAppGP implements Replicable {
                     System.out.println("Executed READ for key " + key + ": " + (row != null ? row.getString(VALUE_COLUMN) : "NOT_FOUND"));
                     break;
                 default:
+                    // If it starts with a command but it's not one of ours, let the user know.
                     System.err.println("Unknown command: " + cmd);
                     return false;
             }
