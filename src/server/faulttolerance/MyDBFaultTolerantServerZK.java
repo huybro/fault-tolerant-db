@@ -26,10 +26,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Custom fault-tolerant replicated database server using a simple Paxos-like protocol
- * with STRICT TOTAL ORDERING.
- * 
- * Key fix: Leader serializes ALL requests - waits for commit before processing next.
+ * Custom fault-tolerant replicated database server with proper recovery.
  */
 public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 
@@ -40,48 +37,39 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 	public static final int MAX_LOG_SIZE = 400;
 	public static final int DEFAULT_PORT = 2181;
 
-	// Cassandra
 	private Session session;
 	private Cluster cluster;
-
-	// Server identity and messaging
 	private final String myID;
 	private final MessageNIOTransport<String, String> serverMessenger;
 	private final NodeConfig<String> nodeConfig;
 	private String leader;
 	private int totalServers = 0;
-
-	// Table structure
 	private static final String TABLE_NAME = "grade";
 
-	// Sequence tracking - STRICT ordering
+	// Sequence tracking
 	private AtomicLong nextSeqToAssign = new AtomicLong(0);
 	private AtomicLong nextSeqToExecute = new AtomicLong(0);
 	
-	// Pending proposals waiting for their turn to execute (for followers)
+	// Pending proposals
 	private ConcurrentHashMap<Long, String> pendingProposals = new ConcurrentHashMap<>();
 	
-	// Leader's pending request awaiting ACKs
+	// Leader state for current proposal
 	private volatile long currentProposalSeq = -1;
-	private volatile String currentProposalCql = null;
 	private volatile int acksReceived = 0;
 	private final Object proposalLock = new Object();
 	
-	// Request queue for serialization at leader
+	// Request queue
 	private LinkedBlockingQueue<PendingRequest> requestQueue = new LinkedBlockingQueue<>();
-	private volatile boolean processingRequest = false;
+	private Thread processorThread;
+	private volatile boolean running = true;
 	
-	// Checkpoint paths
+	// Checkpoint
 	private final String checkpointDir = "paxos_logs";
 	private final String checkpointFile;
 	private final String seqFile;
 
-	// Message types
 	private enum MsgType {
-		REQUEST,
-		PROPOSAL,
-		ACK,
-		COMMIT
+		REQUEST, PROPOSAL, ACK, COMMIT, SYNC_REQUEST, SYNC_REPLY
 	}
 
 	private static class PendingRequest {
@@ -105,19 +93,14 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 
 		new File(checkpointDir).mkdirs();
 
-		// Connect to Cassandra
 		this.cluster = Cluster.builder().addContactPoint("127.0.0.1").build();
 		this.session = cluster.connect(myID);
 
-		// Count servers and elect leader (first node)
 		for (String node : nodeConfig.getNodeIDs()) {
 			if (leader == null) leader = node;
 			totalServers++;
 		}
-		log.log(Level.INFO, "Server {0}: leader={1}, totalServers={2}", 
-				new Object[]{myID, leader, totalServers});
 
-		// Set up server-to-server messaging
 		this.serverMessenger = new MessageNIOTransport<String, String>(myID, nodeConfig,
 				new AbstractBytePacketDemultiplexer() {
 					@Override
@@ -127,14 +110,34 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 					}
 				}, true);
 
-		log.log(Level.INFO, "Server {0} started on {1}", 
-				new Object[]{myID, this.clientMessenger.getListeningSocketAddress()});
+		log.log(Level.INFO, "Server {0} started, leader={1}", new Object[]{myID, leader});
 
+		// Recover from checkpoint first
 		recoverFromCheckpoint();
 		
-		// Start request processor thread (leader only)
+		// Request state sync from leader if not leader
+		if (!myID.equals(leader)) {
+			requestStateSync();
+		}
+		
+		// Start request processor (leader only)
 		if (myID.equals(leader)) {
-			new Thread(this::processRequestQueue, "RequestProcessor-" + myID).start();
+			processorThread = new Thread(this::processRequestQueue, "RequestProcessor-" + myID);
+			processorThread.start();
+		}
+	}
+
+	private void requestStateSync() {
+		try {
+			Thread.sleep(500); // Give leader time to start
+			JSONObject syncReq = new JSONObject();
+			syncReq.put("type", MsgType.SYNC_REQUEST.toString());
+			syncReq.put("from", myID);
+			syncReq.put("mySeq", nextSeqToExecute.get());
+			serverMessenger.send(leader, syncReq.toString().getBytes());
+			log.log(Level.INFO, "{0} requested sync from leader", myID);
+		} catch (Exception e) {
+			log.log(Level.WARNING, "Failed to request sync", e);
 		}
 	}
 
@@ -149,10 +152,8 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 		}
 
 		if (myID.equals(leader)) {
-			// Queue request for ordered processing
 			requestQueue.offer(new PendingRequest(cql, header.sndr));
 		} else {
-			// Forward to leader
 			try {
 				JSONObject msg = new JSONObject();
 				msg.put("type", MsgType.REQUEST.toString());
@@ -161,22 +162,20 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				msg.put("clientPort", header.sndr.getPort());
 				serverMessenger.send(leader, msg.toString().getBytes());
 			} catch (Exception e) {
-				log.log(Level.SEVERE, "Failed to forward to leader", e);
+				log.log(Level.SEVERE, "Forward to leader failed", e);
 			}
 		}
 
-		// Send immediate response
 		sendToClient(header.sndr, "[success:" + request + "]");
 	}
 
-	/**
-	 * Leader processes requests one at a time, waiting for majority ACKs before next.
-	 */
 	private void processRequestQueue() {
-		while (true) {
+		while (running) {
 			try {
-				PendingRequest req = requestQueue.take();
-				processOneRequest(req.cql);
+				PendingRequest req = requestQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+				if (req != null) {
+					processOneRequest(req.cql);
+				}
 			} catch (InterruptedException e) {
 				break;
 			}
@@ -187,7 +186,6 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 		synchronized (proposalLock) {
 			long seqNum = nextSeqToAssign.getAndIncrement();
 			currentProposalSeq = seqNum;
-			currentProposalCql = cql;
 			acksReceived = 0;
 			
 			// Broadcast PROPOSAL
@@ -198,47 +196,33 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				proposal.put("cql", cql);
 
 				for (String node : nodeConfig.getNodeIDs()) {
-					serverMessenger.send(node, proposal.toString().getBytes());
+					try {
+						serverMessenger.send(node, proposal.toString().getBytes());
+					} catch (Exception e) {
+						// Node might be down, continue
+					}
 				}
 			} catch (Exception e) {
-				log.log(Level.SEVERE, "Failed to broadcast proposal", e);
+				log.log(Level.SEVERE, "Broadcast failed", e);
+				return;
 			}
 			
-			// Wait for majority ACKs (with timeout)
+			// Wait for majority
 			int majority = (totalServers / 2) + 1;
-			long deadline = System.currentTimeMillis() + 5000; // 5 sec timeout
+			long deadline = System.currentTimeMillis() + 3000;
 			
 			while (acksReceived < majority && System.currentTimeMillis() < deadline) {
 				try {
-					proposalLock.wait(100);
+					proposalLock.wait(50);
 				} catch (InterruptedException e) {
 					break;
 				}
 			}
 			
-			// Broadcast COMMIT so all replicas know this is committed
-			if (acksReceived >= majority) {
-				broadcastCommit(seqNum);
-			}
-			
-			// Checkpoint if needed
+			// Checkpoint periodically
 			if (nextSeqToAssign.get() % (MAX_LOG_SIZE / 2) == 0) {
 				checkpoint();
 			}
-		}
-	}
-
-	private void broadcastCommit(long seqNum) {
-		try {
-			JSONObject commit = new JSONObject();
-			commit.put("type", MsgType.COMMIT.toString());
-			commit.put("seqNum", seqNum);
-			
-			for (String node : nodeConfig.getNodeIDs()) {
-				serverMessenger.send(node, commit.toString().getBytes());
-			}
-		} catch (Exception e) {
-			log.log(Level.WARNING, "Failed to broadcast commit", e);
 		}
 	}
 
@@ -248,7 +232,6 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 			String type = json.getString("type");
 
 			if (type.equals(MsgType.REQUEST.toString())) {
-				// Leader receives forwarded request
 				if (myID.equals(leader)) {
 					String cql = json.getString("cql");
 					String clientHost = json.optString("clientHost", "");
@@ -259,15 +242,18 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				}
 
 			} else if (type.equals(MsgType.PROPOSAL.toString())) {
-				// All servers receive proposal and execute in order
 				long seqNum = json.getLong("seqNum");
 				String cql = json.getString("cql");
 				
-				// Store and try to execute in order
 				pendingProposals.put(seqNum, cql);
 				executeInOrder();
 				
-				// Send ACK to leader
+				// Update assign counter if behind
+				if (seqNum >= nextSeqToAssign.get()) {
+					nextSeqToAssign.set(seqNum + 1);
+				}
+				
+				// ACK
 				JSONObject ack = new JSONObject();
 				ack.put("type", MsgType.ACK.toString());
 				ack.put("seqNum", seqNum);
@@ -275,7 +261,6 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				serverMessenger.send(leader, ack.toString().getBytes());
 
 			} else if (type.equals(MsgType.ACK.toString())) {
-				// Leader receives ACK
 				if (myID.equals(leader)) {
 					long seqNum = json.getLong("seqNum");
 					synchronized (proposalLock) {
@@ -286,20 +271,49 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 					}
 				}
 
-			} else if (type.equals(MsgType.COMMIT.toString())) {
-				// Optional: handle commit confirmation
-				long seqNum = json.getLong("seqNum");
-				// Could use this for additional consistency guarantees
+			} else if (type.equals(MsgType.SYNC_REQUEST.toString())) {
+				// Leader responds with checkpoint + seq numbers
+				if (myID.equals(leader)) {
+					String fromNode = json.getString("from");
+					long theirSeq = json.getLong("mySeq");
+					
+					String checkpointData = createCheckpointData();
+					JSONObject reply = new JSONObject();
+					reply.put("type", MsgType.SYNC_REPLY.toString());
+					reply.put("checkpoint", checkpointData);
+					reply.put("nextSeqToAssign", nextSeqToAssign.get());
+					reply.put("nextSeqToExecute", nextSeqToExecute.get());
+					
+					for (String node : nodeConfig.getNodeIDs()) {
+						if (node.equals(fromNode)) {
+							serverMessenger.send(node, reply.toString().getBytes());
+							log.log(Level.INFO, "Leader sent sync reply to {0}", fromNode);
+							break;
+						}
+					}
+				}
+
+			} else if (type.equals(MsgType.SYNC_REPLY.toString())) {
+				// Follower receives state sync
+				String checkpointData = json.getString("checkpoint");
+				long leaderAssign = json.getLong("nextSeqToAssign");
+				long leaderExecute = json.getLong("nextSeqToExecute");
+				
+				// Only update if leader is ahead
+				if (leaderExecute > nextSeqToExecute.get()) {
+					restoreFromCheckpointData(checkpointData);
+					nextSeqToAssign.set(leaderAssign);
+					nextSeqToExecute.set(leaderExecute);
+					log.log(Level.INFO, "{0} synced: assign={1}, execute={2}", 
+							new Object[]{myID, leaderAssign, leaderExecute});
+				}
 			}
 
 		} catch (JSONException | IOException e) {
-			log.log(Level.WARNING, "Failed to handle server message", e);
+			log.log(Level.WARNING, "Message handling error", e);
 		}
 	}
 
-	/**
-	 * Execute pending proposals in strict sequence order.
-	 */
 	private synchronized void executeInOrder() {
 		while (true) {
 			long next = nextSeqToExecute.get();
@@ -310,8 +324,8 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				session.execute(cql);
 				nextSeqToExecute.incrementAndGet();
 			} catch (Exception e) {
-				log.log(Level.WARNING, "Failed to execute: " + cql, e);
-				nextSeqToExecute.incrementAndGet(); // Still advance to avoid stuck
+				log.log(Level.WARNING, "Execute failed: " + cql, e);
+				nextSeqToExecute.incrementAndGet();
 			}
 		}
 	}
@@ -328,9 +342,7 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 	private void sendToClient(InetSocketAddress client, String response) {
 		try {
 			serverMessenger.send(client, response.getBytes());
-		} catch (IOException e) {
-			log.log(Level.WARNING, "Failed to send to client", e);
-		}
+		} catch (IOException e) {}
 	}
 
 	private void checkpoint() {
@@ -339,10 +351,7 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 			Files.write(Paths.get(checkpointFile), data.getBytes());
 			Files.write(Paths.get(seqFile), 
 					(nextSeqToAssign.get() + ":" + nextSeqToExecute.get()).getBytes());
-			log.log(Level.INFO, "{0} checkpointed", myID);
-		} catch (IOException e) {
-			log.log(Level.WARNING, "Checkpoint failed", e);
-		}
+		} catch (IOException e) {}
 	}
 
 	private String createCheckpointData() {
@@ -376,12 +385,8 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				String[] parts = seq.split(":");
 				nextSeqToAssign.set(Long.parseLong(parts[0]));
 				nextSeqToExecute.set(Long.parseLong(parts.length > 1 ? parts[1] : parts[0]));
-				log.log(Level.INFO, "{0} recovered: assign={1}, execute={2}", 
-						new Object[]{myID, nextSeqToAssign.get(), nextSeqToExecute.get()});
 			}
-		} catch (Exception e) {
-			log.log(Level.INFO, "{0} no checkpoint", myID);
-		}
+		} catch (Exception e) {}
 	}
 
 	private void restoreFromCheckpointData(String checkpointData) {
@@ -419,14 +424,14 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 					}
 				}
 			}
-		} catch (Exception e) {
-			log.log(Level.WARNING, "Restore failed", e);
-		}
+		} catch (Exception e) {}
 	}
 
 	@Override
 	public void close() {
+		running = false;
 		checkpoint();
+		if (processorThread != null) processorThread.interrupt();
 		if (serverMessenger != null) serverMessenger.stop();
 		if (session != null) session.close();
 		if (cluster != null) cluster.close();
