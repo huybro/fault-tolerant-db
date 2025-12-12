@@ -26,7 +26,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Custom fault-tolerant replicated database server with proper recovery.
+ * Custom fault-tolerant replicated database server.
+ * Simple leader-based protocol with total ordering.
  */
 public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 
@@ -46,19 +47,19 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 	private int totalServers = 0;
 	private static final String TABLE_NAME = "grade";
 
-	// Sequence tracking
+	// Sequence tracking - key to total ordering
 	private AtomicLong nextSeqToAssign = new AtomicLong(0);
 	private AtomicLong nextSeqToExecute = new AtomicLong(0);
 	
-	// Pending proposals
-	private ConcurrentHashMap<Long, String> pendingProposals = new ConcurrentHashMap<>();
+	// Buffer for out-of-order proposals
+	private ConcurrentHashMap<Long, String> proposalBuffer = new ConcurrentHashMap<>();
 	
-	// Leader state for current proposal
+	// Leader state
 	private volatile long currentProposalSeq = -1;
 	private volatile int acksReceived = 0;
 	private final Object proposalLock = new Object();
 	
-	// Request queue
+	// Request queue for leader
 	private LinkedBlockingQueue<PendingRequest> requestQueue = new LinkedBlockingQueue<>();
 	private Thread processorThread;
 	private volatile boolean running = true;
@@ -69,15 +70,13 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 	private final String seqFile;
 
 	private enum MsgType {
-		REQUEST, PROPOSAL, ACK, COMMIT, SYNC_REQUEST, SYNC_REPLY
+		REQUEST, PROPOSAL, ACK
 	}
 
 	private static class PendingRequest {
 		String cql;
-		InetSocketAddress clientAddr;
-		PendingRequest(String cql, InetSocketAddress addr) {
+		PendingRequest(String cql) {
 			this.cql = cql;
-			this.clientAddr = addr;
 		}
 	}
 
@@ -112,32 +111,13 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 
 		log.log(Level.INFO, "Server {0} started, leader={1}", new Object[]{myID, leader});
 
-		// Recover from checkpoint first
+		// Recover from checkpoint
 		recoverFromCheckpoint();
 		
-		// Request state sync from leader if not leader
-		if (!myID.equals(leader)) {
-			requestStateSync();
-		}
-		
-		// Start request processor (leader only)
+		// Start processor thread (leader only processes, but all servers can buffer)
 		if (myID.equals(leader)) {
-			processorThread = new Thread(this::processRequestQueue, "RequestProcessor-" + myID);
+			processorThread = new Thread(this::processRequestQueue, "Processor-" + myID);
 			processorThread.start();
-		}
-	}
-
-	private void requestStateSync() {
-		try {
-			Thread.sleep(500); // Give leader time to start
-			JSONObject syncReq = new JSONObject();
-			syncReq.put("type", MsgType.SYNC_REQUEST.toString());
-			syncReq.put("from", myID);
-			syncReq.put("mySeq", nextSeqToExecute.get());
-			serverMessenger.send(leader, syncReq.toString().getBytes());
-			log.log(Level.INFO, "{0} requested sync from leader", myID);
-		} catch (Exception e) {
-			log.log(Level.WARNING, "Failed to request sync", e);
 		}
 	}
 
@@ -152,17 +132,17 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 		}
 
 		if (myID.equals(leader)) {
-			requestQueue.offer(new PendingRequest(cql, header.sndr));
+			// Queue for ordered processing
+			requestQueue.offer(new PendingRequest(cql));
 		} else {
+			// Forward to leader
 			try {
 				JSONObject msg = new JSONObject();
 				msg.put("type", MsgType.REQUEST.toString());
 				msg.put("cql", cql);
-				msg.put("clientHost", header.sndr.getAddress().getHostAddress());
-				msg.put("clientPort", header.sndr.getPort());
 				serverMessenger.send(leader, msg.toString().getBytes());
 			} catch (Exception e) {
-				log.log(Level.SEVERE, "Forward to leader failed", e);
+				log.log(Level.WARNING, "Forward failed", e);
 			}
 		}
 
@@ -188,18 +168,19 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 			currentProposalSeq = seqNum;
 			acksReceived = 0;
 			
-			// Broadcast PROPOSAL
+			// Broadcast PROPOSAL to all (including self)
 			try {
 				JSONObject proposal = new JSONObject();
 				proposal.put("type", MsgType.PROPOSAL.toString());
 				proposal.put("seqNum", seqNum);
 				proposal.put("cql", cql);
 
+				byte[] data = proposal.toString().getBytes();
 				for (String node : nodeConfig.getNodeIDs()) {
 					try {
-						serverMessenger.send(node, proposal.toString().getBytes());
+						serverMessenger.send(node, data);
 					} catch (Exception e) {
-						// Node might be down, continue
+						// Node may be down
 					}
 				}
 			} catch (Exception e) {
@@ -207,20 +188,20 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				return;
 			}
 			
-			// Wait for majority
+			// Wait for majority ACKs
 			int majority = (totalServers / 2) + 1;
-			long deadline = System.currentTimeMillis() + 3000;
+			long deadline = System.currentTimeMillis() + 5000;
 			
 			while (acksReceived < majority && System.currentTimeMillis() < deadline) {
 				try {
-					proposalLock.wait(50);
+					proposalLock.wait(100);
 				} catch (InterruptedException e) {
 					break;
 				}
 			}
 			
 			// Checkpoint periodically
-			if (nextSeqToAssign.get() % (MAX_LOG_SIZE / 2) == 0) {
+			if (seqNum > 0 && seqNum % (MAX_LOG_SIZE / 2) == 0) {
 				checkpoint();
 			}
 		}
@@ -232,33 +213,33 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 			String type = json.getString("type");
 
 			if (type.equals(MsgType.REQUEST.toString())) {
+				// Leader receives forwarded request
 				if (myID.equals(leader)) {
 					String cql = json.getString("cql");
-					String clientHost = json.optString("clientHost", "");
-					int clientPort = json.optInt("clientPort", 0);
-					InetSocketAddress clientAddr = clientHost.isEmpty() ? null : 
-							new InetSocketAddress(clientHost, clientPort);
-					requestQueue.offer(new PendingRequest(cql, clientAddr));
+					requestQueue.offer(new PendingRequest(cql));
 				}
 
 			} else if (type.equals(MsgType.PROPOSAL.toString())) {
 				long seqNum = json.getLong("seqNum");
 				String cql = json.getString("cql");
 				
-				pendingProposals.put(seqNum, cql);
-				executeInOrder();
+				// Buffer and execute in order
+				proposalBuffer.put(seqNum, cql);
+				executeBufferedProposals();
 				
-				// Update assign counter if behind
+				// Keep sequence numbers in sync
 				if (seqNum >= nextSeqToAssign.get()) {
 					nextSeqToAssign.set(seqNum + 1);
 				}
 				
-				// ACK
-				JSONObject ack = new JSONObject();
-				ack.put("type", MsgType.ACK.toString());
-				ack.put("seqNum", seqNum);
-				ack.put("from", myID);
-				serverMessenger.send(leader, ack.toString().getBytes());
+				// Send ACK
+				try {
+					JSONObject ack = new JSONObject();
+					ack.put("type", MsgType.ACK.toString());
+					ack.put("seqNum", seqNum);
+					ack.put("from", myID);
+					serverMessenger.send(leader, ack.toString().getBytes());
+				} catch (Exception e) {}
 
 			} else if (type.equals(MsgType.ACK.toString())) {
 				if (myID.equals(leader)) {
@@ -270,63 +251,28 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 						}
 					}
 				}
-
-			} else if (type.equals(MsgType.SYNC_REQUEST.toString())) {
-				// Leader responds with checkpoint + seq numbers
-				if (myID.equals(leader)) {
-					String fromNode = json.getString("from");
-					long theirSeq = json.getLong("mySeq");
-					
-					String checkpointData = createCheckpointData();
-					JSONObject reply = new JSONObject();
-					reply.put("type", MsgType.SYNC_REPLY.toString());
-					reply.put("checkpoint", checkpointData);
-					reply.put("nextSeqToAssign", nextSeqToAssign.get());
-					reply.put("nextSeqToExecute", nextSeqToExecute.get());
-					
-					for (String node : nodeConfig.getNodeIDs()) {
-						if (node.equals(fromNode)) {
-							serverMessenger.send(node, reply.toString().getBytes());
-							log.log(Level.INFO, "Leader sent sync reply to {0}", fromNode);
-							break;
-						}
-					}
-				}
-
-			} else if (type.equals(MsgType.SYNC_REPLY.toString())) {
-				// Follower receives state sync
-				String checkpointData = json.getString("checkpoint");
-				long leaderAssign = json.getLong("nextSeqToAssign");
-				long leaderExecute = json.getLong("nextSeqToExecute");
-				
-				// Only update if leader is ahead
-				if (leaderExecute > nextSeqToExecute.get()) {
-					restoreFromCheckpointData(checkpointData);
-					nextSeqToAssign.set(leaderAssign);
-					nextSeqToExecute.set(leaderExecute);
-					log.log(Level.INFO, "{0} synced: assign={1}, execute={2}", 
-							new Object[]{myID, leaderAssign, leaderExecute});
-				}
 			}
 
-		} catch (JSONException | IOException e) {
-			log.log(Level.WARNING, "Message handling error", e);
+		} catch (JSONException e) {
+			log.log(Level.WARNING, "Parse error", e);
 		}
 	}
 
-	private synchronized void executeInOrder() {
+	/**
+	 * Execute proposals in strict sequence order from buffer.
+	 */
+	private synchronized void executeBufferedProposals() {
 		while (true) {
 			long next = nextSeqToExecute.get();
-			String cql = pendingProposals.remove(next);
+			String cql = proposalBuffer.remove(next);
 			if (cql == null) break;
 			
 			try {
 				session.execute(cql);
-				nextSeqToExecute.incrementAndGet();
 			} catch (Exception e) {
 				log.log(Level.WARNING, "Execute failed: " + cql, e);
-				nextSeqToExecute.incrementAndGet();
 			}
+			nextSeqToExecute.incrementAndGet();
 		}
 	}
 
@@ -385,8 +331,12 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				String[] parts = seq.split(":");
 				nextSeqToAssign.set(Long.parseLong(parts[0]));
 				nextSeqToExecute.set(Long.parseLong(parts.length > 1 ? parts[1] : parts[0]));
+				log.log(Level.INFO, "{0} recovered seq={1}/{2}", 
+						new Object[]{myID, nextSeqToAssign.get(), nextSeqToExecute.get()});
 			}
-		} catch (Exception e) {}
+		} catch (Exception e) {
+			log.log(Level.INFO, "{0} no checkpoint", myID);
+		}
 	}
 
 	private void restoreFromCheckpointData(String checkpointData) {
@@ -424,7 +374,9 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 					}
 				}
 			}
-		} catch (Exception e) {}
+		} catch (Exception e) {
+			log.log(Level.WARNING, "Restore failed", e);
+		}
 	}
 
 	@Override
